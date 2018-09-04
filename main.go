@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
@@ -11,37 +12,20 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/google/go-github/github"
+	"golang.org/x/net/websocket"
 	"golang.org/x/oauth2"
 )
 
 type client struct {
 	*github.Client
+	path string
 	repo string
-	html string
-	css  string
 }
 
-func (c *client) init() error {
-	const url = "https://raw.githubusercontent.com/sindresorhus/github-markdown-css/gh-pages/github-markdown.css"
-	rsp, err := http.Get(url)
+func (c *client) load() (string, error) {
+	md, err := ioutil.ReadFile(c.path)
 	if err != nil {
-		return err
-	}
-	defer rsp.Body.Close()
-
-	css, err := ioutil.ReadAll(rsp.Body)
-	if err != nil {
-		return err
-	}
-
-	c.css = string(css)
-	return nil
-}
-
-func (c *client) load(path string) error {
-	md, err := ioutil.ReadFile(path)
-	if err != nil {
-		return err
+		return "", err
 	}
 
 	opts := &github.MarkdownOptions{
@@ -52,14 +36,61 @@ func (c *client) load(path string) error {
 		opts.Mode = "gdm"
 	}
 
-	log.Print("rendering " + path)
-	html, _, err := c.Markdown(context.Background(), string(md), opts)
-	if err != nil {
-		return err
-	}
+	s, _, err := c.Markdown(context.Background(), string(md), opts)
+	return s, err
+}
 
-	c.html = html
-	return nil
+func (c *client) sock(ws *websocket.Conn) {
+	defer ws.Close()
+
+	s, err := c.load()
+	if err != nil {
+		log.Print(err)
+		return
+	}
+	io.WriteString(ws, s)
+
+	w, err := fsnotify.NewWatcher()
+	if err != nil {
+		log.Fatal(err)
+	}
+	w.Add(c.path)
+	defer w.Close()
+
+	end := make(chan bool)
+	go func() {
+		for e := range w.Events {
+			if e.Op != fsnotify.Write {
+				continue
+			}
+			s, err := c.load()
+			if err != nil {
+				log.Print(err)
+			}
+			io.WriteString(ws, s)
+		}
+		close(end)
+	}()
+
+	go func() {
+		for err := range w.Errors {
+			log.Print(err)
+		}
+	}()
+
+	<-end
+}
+
+func style() (string, error) {
+	const url = "https://raw.githubusercontent.com/sindresorhus/github-markdown-css/gh-pages/github-markdown.css"
+	rsp, err := http.Get(url)
+	if err != nil {
+		return "", err
+	}
+	defer rsp.Body.Close()
+
+	s, err := ioutil.ReadAll(rsp.Body)
+	return string(s), err
 }
 
 func main() {
@@ -67,7 +98,6 @@ func main() {
 	port := flag.Int("p", 8080, "listen on `port`")
 	repo := flag.String("r", "", "render in context of `repo`")
 	flag.Parse()
-	path := flag.Arg(0)
 
 	var tc *http.Client
 	if t := os.Getenv("TOKEN"); t != "" {
@@ -78,58 +108,37 @@ func main() {
 
 	c := &client{
 		Client: github.NewClient(tc),
+		path:   flag.Arg(0),
 		repo:   *repo,
 	}
 
-	if err := c.init(); err != nil {
-		log.Fatal(err)
-	}
-
-	if err := c.load(path); err != nil {
-		log.Fatal(err)
-	}
-
-	w, err := fsnotify.NewWatcher()
+	css, err := style()
 	if err != nil {
 		log.Fatal(err)
 	}
-	w.Add(path)
-
-	go func() {
-		for e := range w.Events {
-			if e.Op != fsnotify.Write {
-				continue
-			}
-			if err := c.load(e.Name); err != nil {
-				log.Print(err)
-			}
-		}
-	}()
-
-	go func() {
-		for err := range w.Errors {
-			log.Print(err)
-		}
-	}()
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, page, c.css, c.html)
+		fmt.Fprintf(w, page, *port, css)
 	})
+
+	http.Handle("/sock", websocket.Handler(c.sock))
 
 	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", *port), nil))
 }
 
 const page = `<!DOCTYPE html>
 <html>
-<head>
-<style>
-%s
-</style>
-</head>
-<body>
-<article class="markdown-body">
-%s
-</article>
-</body>
+    <head>
+        <script>
+            var sock = new WebSocket("ws://localhost:%d/sock");
+            sock.onmessage = function (e) {
+                document.getElementById("gmd-container").innerHTML = e.data;
+            }
+        </script>
+        <style>%s</style>
+    </head>
+    <body>
+        <article id="gmd-container" class="markdown-body"></article>
+    </body>
 </html>
 `
