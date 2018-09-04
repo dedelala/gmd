@@ -143,6 +143,11 @@ func main() {
 	repo := flag.String("r", "", "render in context of `repo`")
 	flag.Parse()
 
+	css, err := style()
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	r := newRenderer(os.Getenv("TOKEN"), *repo)
 	s := newServer()
 
@@ -150,17 +155,6 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	css, err := style()
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, page, *port, r.URL.Path, css)
-	})
-
-	http.Handle("/sock/", websocket.Handler(s.sock))
 
 	go func() {
 		for ev := range evs {
@@ -173,6 +167,12 @@ func main() {
 			s.refresh <- ev
 		}
 	}()
+
+	http.Handle("/sock/", websocket.Handler(s.sock))
+
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, page, *port, r.URL.Path, css)
+	})
 
 	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", *port), nil))
 }
