@@ -8,19 +8,17 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/google/go-github/github"
 	"golang.org/x/oauth2"
 )
 
 type client struct {
 	*github.Client
-	src  string
-	ctx  string
+	repo string
 	html string
 	css  string
-	mod  time.Time
 }
 
 func (c *client) init() error {
@@ -40,30 +38,21 @@ func (c *client) init() error {
 	return nil
 }
 
-func (c *client) load() error {
-	s, err := os.Stat(c.src)
-	if err != nil {
-		return err
-	}
-	if c.mod == s.ModTime() {
-		return nil
-	}
-	c.mod = s.ModTime()
-
-	md, err := ioutil.ReadFile(c.src)
+func (c *client) load(path string) error {
+	md, err := ioutil.ReadFile(path)
 	if err != nil {
 		return err
 	}
 
 	opts := &github.MarkdownOptions{
 		Mode:    "markdown",
-		Context: c.ctx,
+		Context: c.repo,
 	}
-	if c.ctx != "" {
+	if c.repo != "" {
 		opts.Mode = "gdm"
 	}
 
-	log.Print("rendering " + c.src)
+	log.Print("rendering " + path)
 	html, _, err := c.Markdown(context.Background(), string(md), opts)
 	if err != nil {
 		return err
@@ -75,9 +64,10 @@ func (c *client) load() error {
 
 func main() {
 	log.SetFlags(0)
-	prt := flag.Int("p", 8080, "listen on `port`")
-	ctx := flag.String("r", "", "render in context of `repo`")
+	port := flag.Int("p", 8080, "listen on `port`")
+	repo := flag.String("r", "", "render in context of `repo`")
 	flag.Parse()
+	path := flag.Arg(0)
 
 	var tc *http.Client
 	if t := os.Getenv("TOKEN"); t != "" {
@@ -88,20 +78,37 @@ func main() {
 
 	c := &client{
 		Client: github.NewClient(tc),
-		src:    flag.Arg(0),
-		ctx:    *ctx,
+		repo:   *repo,
 	}
 
 	if err := c.init(); err != nil {
 		log.Fatal(err)
 	}
 
+	if err := c.load(path); err != nil {
+		log.Fatal(err)
+	}
+
+	w, err := fsnotify.NewWatcher()
+	if err != nil {
+		log.Fatal(err)
+	}
+	w.Add(path)
+
 	go func() {
-		t := time.NewTicker(100 * time.Millisecond)
-		for range t.C {
-			if err := c.load(); err != nil {
-				log.Fatal(err)
+		for e := range w.Events {
+			if e.Op != fsnotify.Write {
+				continue
 			}
+			if err := c.load(e.Name); err != nil {
+				log.Print(err)
+			}
+		}
+	}()
+
+	go func() {
+		for err := range w.Errors {
+			log.Print(err)
 		}
 	}()
 
@@ -109,10 +116,11 @@ func main() {
 		fmt.Fprintf(w, page, c.css, c.html)
 	})
 
-	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", *prt), nil))
+	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", *port), nil))
 }
 
-const page = `<html>
+const page = `<!DOCTYPE html>
+<html>
 <head>
 <style>
 %s
