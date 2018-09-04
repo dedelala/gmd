@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/go-github/github"
+	"golang.org/x/oauth2"
 )
 
 type client struct {
@@ -78,8 +79,15 @@ func main() {
 	ctx := flag.String("r", "", "render in context of `repo`")
 	flag.Parse()
 
+	var tc *http.Client
+	if t := os.Getenv("TOKEN"); t != "" {
+		ctx := context.Background()
+		ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: t})
+		tc = oauth2.NewClient(ctx, ts)
+	}
+
 	c := &client{
-		Client: github.NewClient(nil),
+		Client: github.NewClient(tc),
 		src:    flag.Arg(0),
 		ctx:    *ctx,
 	}
