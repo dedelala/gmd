@@ -8,7 +8,7 @@ the page is updated by websocket.
 **Usage**
 
 ```
-TOKEN="..." gmd README.md
+TOKEN="..." gmd *.md
 ```
 
 **Options**

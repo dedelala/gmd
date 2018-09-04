@@ -4,11 +4,12 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
+	"sort"
+	"strings"
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/google/go-github/github"
@@ -16,60 +17,103 @@ import (
 	"golang.org/x/oauth2"
 )
 
-type client struct {
+type renderer struct {
 	*github.Client
-	path string
 	repo string
 }
 
-func (c *client) load() (string, error) {
-	md, err := ioutil.ReadFile(c.path)
+func newRenderer(token, repo string) *renderer {
+	var tc *http.Client
+	if token != "" {
+		ctx := context.Background()
+		ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token})
+		tc = oauth2.NewClient(ctx, ts)
+	}
+
+	return &renderer{github.NewClient(tc), repo}
+}
+
+func (r *renderer) render(path string) (string, error) {
+	md, err := ioutil.ReadFile(path)
 	if err != nil {
 		return "", err
 	}
 
 	opts := &github.MarkdownOptions{
 		Mode:    "markdown",
-		Context: c.repo,
+		Context: r.repo,
 	}
-	if c.repo != "" {
+	if r.repo != "" {
 		opts.Mode = "gdm"
 	}
 
-	s, _, err := c.Markdown(context.Background(), string(md), opts)
-	return s, err
+	s, _, err := r.Markdown(context.Background(), string(md), opts)
+	if err != nil {
+		return "", err
+	}
+	return s, nil
 }
 
-func (c *client) sock(ws *websocket.Conn) {
-	defer ws.Close()
+type server struct {
+	html    map[string]string
+	refresh chan string
+}
 
-	s, err := c.load()
-	if err != nil {
-		log.Print(err)
-		return
+func newServer() *server {
+	return &server{
+		html:    map[string]string{},
+		refresh: make(chan string),
 	}
-	io.WriteString(ws, s)
+}
 
+func (s *server) nav() string {
+	ps := []string{}
+	for p := range s.html {
+		ps = append(ps, p)
+	}
+	sort.Strings(ps)
+
+	const link = `<li><a href="/%s">%[1]s</a></li>`
+	n := "<nav><ul>"
+	for _, p := range ps {
+		n += fmt.Sprintf(link, p)
+	}
+	n += "</ul></nav>"
+	return n
+}
+
+func (s *server) sock(ws *websocket.Conn) {
+	defer ws.Close()
+	const article = `<article class="markdown-body">%s</article>`
+	path := strings.TrimPrefix(ws.Config().Location.Path, "/sock/")
+
+	fmt.Fprintf(ws, s.nav()+article, s.html[path])
+	for range s.refresh {
+		fmt.Fprintf(ws, s.nav()+article, s.html[path])
+	}
+}
+
+func watch(paths []string) (chan string, error) {
 	w, err := fsnotify.NewWatcher()
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
-	w.Add(c.path)
-	defer w.Close()
 
-	end := make(chan bool)
+	c := make(chan string)
+	for _, p := range paths {
+		w.Add(p)
+	}
+
 	go func() {
+		for _, p := range paths {
+			c <- p
+		}
 		for e := range w.Events {
 			if e.Op != fsnotify.Write {
 				continue
 			}
-			s, err := c.load()
-			if err != nil {
-				log.Print(err)
-			}
-			io.WriteString(ws, s)
+			c <- e.Name
 		}
-		close(end)
 	}()
 
 	go func() {
@@ -78,7 +122,7 @@ func (c *client) sock(ws *websocket.Conn) {
 		}
 	}()
 
-	<-end
+	return c, nil
 }
 
 func style() (string, error) {
@@ -99,17 +143,12 @@ func main() {
 	repo := flag.String("r", "", "render in context of `repo`")
 	flag.Parse()
 
-	var tc *http.Client
-	if t := os.Getenv("TOKEN"); t != "" {
-		ctx := context.Background()
-		ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: t})
-		tc = oauth2.NewClient(ctx, ts)
-	}
+	r := newRenderer(os.Getenv("TOKEN"), *repo)
+	s := newServer()
 
-	c := &client{
-		Client: github.NewClient(tc),
-		path:   flag.Arg(0),
-		repo:   *repo,
+	evs, err := watch(flag.Args())
+	if err != nil {
+		log.Fatal(err)
 	}
 
 	css, err := style()
@@ -118,10 +157,22 @@ func main() {
 	}
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, page, *port, css)
+		fmt.Fprintf(w, page, *port, r.URL.Path, css)
 	})
 
-	http.Handle("/sock", websocket.Handler(c.sock))
+	http.Handle("/sock/", websocket.Handler(s.sock))
+
+	go func() {
+		for ev := range evs {
+			html, err := r.render(ev)
+			if err != nil {
+				log.Print(err)
+				continue
+			}
+			s.html[ev] = html
+			s.refresh <- ev
+		}
+	}()
 
 	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", *port), nil))
 }
@@ -130,7 +181,7 @@ const page = `<!DOCTYPE html>
 <html>
     <head>
         <script>
-            var sock = new WebSocket("ws://localhost:%d/sock");
+            var sock = new WebSocket("ws://localhost:%d/sock%s");
             sock.onmessage = function (e) {
                 document.getElementById("gmd-container").innerHTML = e.data;
             }
@@ -138,7 +189,7 @@ const page = `<!DOCTYPE html>
         <style>%s</style>
     </head>
     <body>
-        <article id="gmd-container" class="markdown-body"></article>
+        <div id="gmd-container"></div>
     </body>
 </html>
 `
