@@ -56,12 +56,14 @@ func (r *renderer) render(path string) (string, error) {
 
 type server struct {
 	html    map[string]string
+	seen    map[string]bool
 	refresh chan string
 }
 
 func newServer() *server {
 	return &server{
 		html:    map[string]string{},
+		seen:    map[string]bool{},
 		refresh: make(chan string),
 	}
 }
@@ -73,10 +75,15 @@ func (s *server) nav() string {
 	}
 	sort.Strings(ps)
 
-	const link = `<li><a href="/%s">%[1]s</a></li>`
+	const link = `<li><a href="/%s">%s</a></li>`
+
 	n := "<nav><ul>"
 	for _, p := range ps {
-		n += fmt.Sprintf(link, p)
+		l := p
+		if !s.seen[p] {
+			l = "<em>" + l + "</em>"
+		}
+		n += fmt.Sprintf(link, p, l)
 	}
 	n += "</ul></nav>"
 	return n
@@ -87,8 +94,11 @@ func (s *server) sock(ws *websocket.Conn) {
 	const article = `<article class="markdown-body">%s</article>`
 	path := strings.TrimPrefix(ws.Config().Location.Path, "/sock/")
 
+	s.seen[path] = true
 	fmt.Fprintf(ws, s.nav()+article, s.html[path])
-	for range s.refresh {
+	for ev := range s.refresh {
+		s.seen[ev] = false
+		s.seen[path] = true
 		fmt.Fprintf(ws, s.nav()+article, s.html[path])
 	}
 }
