@@ -4,10 +4,12 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
+	"path"
 	"sort"
 	"strings"
 
@@ -22,15 +24,18 @@ type renderer struct {
 	repo string
 }
 
-func newRenderer(token, repo string) *renderer {
+func newRenderer(token, repo, url string) (*renderer, error) {
 	var tc *http.Client
 	if token != "" {
 		ctx := context.Background()
 		ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token})
 		tc = oauth2.NewClient(ctx, ts)
 	}
-
-	return &renderer{github.NewClient(tc), repo}
+	if url != "" {
+		c, err := github.NewEnterpriseClient(url, url, tc)
+		return &renderer{c, repo}, err
+	}
+	return &renderer{github.NewClient(tc), repo}, nil
 }
 
 func (r *renderer) render(path string) (string, error) {
@@ -151,6 +156,8 @@ func main() {
 	log.SetFlags(0)
 	port := flag.Int("p", 8080, "listen on `port`")
 	repo := flag.String("r", "", "render in context of `repo`")
+	url := flag.String("u", "", "github enterprise url")
+
 	flag.Parse()
 
 	css, err := style()
@@ -158,29 +165,51 @@ func main() {
 		log.Fatal(err)
 	}
 
-	r := newRenderer(os.Getenv("TOKEN"), *repo)
+	r, err := newRenderer(os.Getenv("TOKEN"), *repo, *url)
+	if err != nil {
+		log.Fatal(err)
+	}
 	s := newServer()
 
-	evs, err := watch(flag.Args())
+	paths, err := watch(flag.Args())
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	go func() {
-		for ev := range evs {
-			html, err := r.render(ev)
+		for p := range paths {
+			html, err := r.render(p)
 			if err != nil {
 				log.Print(err)
 				continue
 			}
-			s.html[ev] = html
-			s.refresh <- ev
+			s.html[p] = html
+			s.refresh <- p
 		}
 	}()
 
 	http.Handle("/sock/", websocket.Handler(s.sock))
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if path.Ext(r.URL.Path) != ".md" {
+			d, err := os.Getwd()
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			p := path.Join(d, r.URL.Path)
+			f, err := os.Open(p)
+			if err != nil {
+				if os.IsNotExist(err) {
+					http.Error(w, err.Error(), http.StatusNotFound)
+					return
+				}
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			defer f.Close()
+			io.Copy(w, f)
+		}
 		fmt.Fprintf(w, page, *port, r.URL.Path, css)
 	})
 
